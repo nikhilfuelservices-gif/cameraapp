@@ -23,9 +23,7 @@ class PhotoViewerActivity : ComponentActivity() {
         }
         root.addView(image, FrameLayout.LayoutParams(-1, -1))
         val badge = TextView(this).apply {
-            text = if (verified) "✓ ORIGINAL VERIFIED
-$stamp" else "⚠ MODIFIED / NOT ORIGINAL
-$stamp"
+            text = if (verified) "✓ ORIGINAL VERIFIED\n$stamp" else "⚠ MODIFIED / NOT ORIGINAL\n$stamp"
             textSize = 14f
             setTextColor(0xFFFFFFFF.toInt())
             setPadding(18, 16, 18, 16)
