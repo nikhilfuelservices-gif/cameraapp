@@ -1,97 +1,192 @@
 package com.example.cameraapp
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.os.Bundle
-import android.os.SystemClock
-import android.provider.Settings
+import android.view.ScaleGestureDetector
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.TextView
 import androidx.activity.ComponentActivity
-import androidx.camera.core.*
+import androidx.camera.core.Camera
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import java.io.File
-import java.io.FileOutputStream
-import java.net.HttpURLConnection
-import java.net.URL
 import java.text.SimpleDateFormat
-import java.util.*
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.math.max
 
 class MainActivity : ComponentActivity() {
     private lateinit var preview: PreviewView
-    private lateinit var stamp: TextView
-    private lateinit var imageCapture: ImageCapture
+    private lateinit var timeText: TextView
+    private lateinit var captureButton: Button
+    private var imageCapture: ImageCapture? = null
+    private var camera: Camera? = null
     private var lens = CameraSelector.LENS_FACING_BACK
-    private var trustedBase = 0L
-    private var monoBase = 0L
-    private val executor = Executors.newSingleThreadExecutor()
-    private val fmt = SimpleDateFormat("dd-MM-yyyy HH:mm:ss 'IST'", Locale.US).apply { timeZone = TimeZone.getTimeZone("Asia/Kolkata") }
+    private val cameraExecutor = Executors.newSingleThreadExecutor()
+    private val timeExecutor = Executors.newSingleThreadScheduledExecutor()
+    private val timeAuthority = TimeAuthority()
+    private lateinit var store: SecurityStore
+    private val timeFormat = SimpleDateFormat("dd-MM-yyyy HH:mm:ss 'IST'", Locale.US).apply {
+        timeZone = TimeZone.getTimeZone("Asia/Kolkata")
+    }
+    private var syncInProgress = false
+    private var lastSyncOk = false
+    private var zoom = 1f
 
-    override fun onCreate(b: Bundle?) {
-        super.onCreate(b)
+    override fun onCreate(state: Bundle?) {
+        super.onCreate(state)
         setContentView(R.layout.activity_main)
-        preview = findViewById(R.id.preview); stamp = findViewById(R.id.timeText)
-        findViewById<Button>(R.id.flip).setOnClickListener { lens = if(lens==CameraSelector.LENS_FACING_BACK) CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK; startCamera() }
-        findViewById<Button>(R.id.capture).setOnClickListener { capture() }
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) ActivityCompat.requestPermissions(this,arrayOf(Manifest.permission.CAMERA),7) else startCamera()
-        syncTime()
-        preview.setOnTouchListener { _, _ -> false }
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        preview = findViewById(R.id.preview)
+        timeText = findViewById(R.id.timeText)
+        captureButton = findViewById(R.id.capture)
+        store = SecurityStore(this)
+
+        findViewById<Button>(R.id.flip).setOnClickListener {
+            lens = if (lens == CameraSelector.LENS_FACING_BACK) CameraSelector.LENS_FACING_FRONT
+                   else CameraSelector.LENS_FACING_BACK
+            startCamera()
+        }
+        findViewById<Button>(R.id.gallery).setOnClickListener {
+            startActivity(Intent(this, GalleryActivity::class.java))
+        }
+        captureButton.setOnClickListener { capture() }
+
+        val detector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(d: ScaleGestureDetector): Boolean {
+                val c = camera ?: return true
+                val state = c.cameraInfo.zoomState.value ?: return true
+                zoom = (zoom * d.scaleFactor).coerceIn(state.minZoomRatio, state.maxZoomRatio)
+                c.cameraControl.setZoomRatio(zoom)
+                return true
+            }
+        })
+        preview.setOnTouchListener { _, event -> detector.onTouchEvent(event); true }
+
+        captureButton.isEnabled = false
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), 10)
+        } else startCamera()
+
+        updateClock()
+        syncTimeAsync()
+        timeExecutor.scheduleAtFixedRate({ syncTimeAsync() }, 2, 2, TimeUnit.MINUTES)
     }
 
-    private fun syncTime() {
-        executor.execute {
-            var best = 0L
-            listOf("https://www.google.com","https://www.cloudflare.com","https://www.microsoft.com").forEach { u ->
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, results: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, results)
+        if (requestCode == 10 && results.firstOrNull() == PackageManager.PERMISSION_GRANTED) startCamera()
+    }
+
+    private fun startCamera() {
+        ProcessCameraProvider.getInstance(this).also { future ->
+            future.addListener({
                 try {
-                    val c=URL(u).openConnection() as HttpURLConnection; c.connectTimeout=2500;c.readTimeout=2500; c.requestMethod="HEAD"; c.connect()
-                    val t=c.date; if(t>best) best=t; c.disconnect()
-                } catch(_:Exception){}
-            }
-            if(best>0){ trustedBase=best; monoBase=SystemClock.elapsedRealtime() }
+                    val provider = future.get()
+                    val selector = CameraSelector.Builder().requireLensFacing(lens).build()
+                    val previewUseCase = Preview.Builder().build().also {
+                        it.setSurfaceProvider(preview.surfaceProvider)
+                    }
+                    val capture = ImageCapture.Builder()
+                        .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                        .setJpegQuality(92)
+                        .build()
+                    provider.unbindAll()
+                    camera = provider.bindToLifecycle(this, selector, previewUseCase, capture)
+                    imageCapture = capture
+                    zoom = 1f
+                } catch (_: Exception) {
+                    runOnUiThread { timeText.text = "CAMERA ERROR" }
+                }
+            }, ContextCompat.getMainExecutor(this))
+        }
+    }
+
+    private fun syncTimeAsync() {
+        if (syncInProgress) return
+        syncInProgress = true
+        timeExecutor.execute {
+            lastSyncOk = timeAuthority.sync()
+            syncInProgress = false
             runOnUiThread { updateClock() }
         }
     }
 
-    private fun trustedNow(): Long = if(trustedBase>0) trustedBase + (SystemClock.elapsedRealtime()-monoBase) else 0L
-
     private fun updateClock() {
-        val t=trustedNow()
-        stamp.text=if(t>0) fmt.format(Date(t)) else "INTERNET TIME SYNCING..."
-        stamp.postDelayed({updateClock()},1000)
-    }
-
-    private fun startCamera() {
-        val f=ProcessCameraProvider.getInstance(this)
-        f.addListener({
-            val p=f.get()
-            val selector=CameraSelector.Builder().requireLensFacing(lens).build()
-            imageCapture=ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY).build()
-            p.unbindAll(); p.bindToLifecycle(this,selector,Preview.Builder().build().also{it.setSurfaceProvider(preview.surfaceProvider)},imageCapture)
-        },ContextCompat.getMainExecutor(this))
+        val snapshot = timeAuthority.snapshot()
+        if (snapshot == null) {
+            timeText.text = "INTERNET TIME: SYNCING…"
+            captureButton.isEnabled = false
+        } else {
+            timeText.text = "VERIFIED • " + timeFormat.format(Date(snapshot.epochMs))
+            captureButton.isEnabled = imageCapture != null && lastSyncOk
+        }
+        timeText.postDelayed({ updateClock() }, 1000)
     }
 
     private fun capture() {
-        if(trustedNow()<=0) return
-        val dir=File(filesDir,"captures").apply{mkdirs()}
-        val name="CAM_"+SimpleDateFormat("yyyyMMdd_HHmmss_SSS",Locale.US).format(Date(trustedNow()))+".jpg"
-        val out=File(dir,name)
-        imageCapture.takePicture(ContextCompat.getMainExecutor(this),object:ImageCapture.OnImageCapturedCallback(){
-            override fun onCaptureSuccess(image:ImageProxy){
-                val bmp=image.toBitmap()
-                val canvas=Canvas(bmp); val p=Paint(Paint.ANTI_ALIAS_FLAG).apply{color=Color.WHITE;textSize=max(24f,bmp.width/45f);setShadowLayer(5f,2f,2f,Color.BLACK)}
-                canvas.drawText(fmt.format(Date(trustedNow())),30f,bmp.height-35f,p)
-                FileOutputStream(out).use{bmp.compress(Bitmap.CompressFormat.JPEG,95,it)}
-                image.close()
+        val capture = imageCapture ?: return
+        val epoch = timeAuthority.snapshot()?.epochMs ?: return
+        captureButton.isEnabled = false
+        val temp = File.createTempFile("capture_", ".jpg", cacheDir)
+        val options = ImageCapture.OutputFileOptions.Builder(temp).build()
+        capture.takePicture(options, cameraExecutor, object : ImageCapture.OnImageSavedCallback {
+            override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                try {
+                    val bitmap = BitmapFactory.decodeFile(temp.absolutePath)
+                        ?: throw IllegalStateException("Unable to decode captured image")
+                    val timestamp = timeFormat.format(Date(epoch))
+                    val canvas = Canvas(bitmap)
+                    val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                        color = Color.WHITE
+                        textSize = max(28f, bitmap.width / 42f)
+                        setShadowLayer(6f, 2f, 2f, Color.BLACK)
+                    }
+                    canvas.drawText(timestamp, 28f, bitmap.height - 36f, paint)
+
+                    val sequence = store.nextSequence()
+                    val finalFile = File(store.photoDir(), "CAM_%06d.jpg".format(sequence))
+                    finalFile.outputStream().use { out ->
+                        if (!bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 95, out)) {
+                            throw IllegalStateException("JPEG encode failed")
+                        }
+                    }
+                    bitmap.recycle()
+                    temp.delete()
+                    store.createRecord(finalFile, epoch, timestamp)
+                } catch (_: Exception) {
+                    temp.delete()
+                } finally {
+                    runOnUiThread { updateClock() }
+                }
+            }
+
+            override fun onError(exception: ImageCaptureException) {
+                temp.delete()
+                runOnUiThread { updateClock() }
             }
         })
+    }
+
+    override fun onDestroy() {
+        timeExecutor.shutdownNow()
+        cameraExecutor.shutdownNow()
+        super.onDestroy()
     }
 }
