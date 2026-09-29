@@ -151,8 +151,7 @@ class SecurityStore(context: Context) {
     ) = listOf(
         id, sequence.toString(), epochMs.toString(), timestampText,
         photoFile, photoSha256, previousHash
-    ).joinToString("
-")
+    ).joinToString("\n")
 
     private fun recordHash(canonicalBytes: ByteArray, signature: ByteArray): String =
         sha256(canonicalBytes + signature)
