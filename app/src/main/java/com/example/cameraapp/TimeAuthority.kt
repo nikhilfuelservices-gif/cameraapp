@@ -59,4 +59,19 @@ class TimeAuthority {
         if (age < 0 || age > maxAgeMs) return null
         return Snapshot(nowMono + offset, age)
     }
+    private fun parseHttpDate(value: String): Long {
+        val formats = listOf(
+            "EEE, dd MMM yyyy HH:mm:ss z",
+            "EEE, dd-MMM-yyyy HH:mm:ss z",
+            "EEE MMM dd HH:mm:ss yyyy"
+        )
+        for (pattern in formats) {
+            try {
+                val sdf = java.text.SimpleDateFormat(pattern, java.util.Locale.US)
+                sdf.timeZone = java.util.TimeZone.getTimeZone("GMT")
+                return sdf.parse(value)?.time ?: 0L
+            } catch (_: Exception) { }
+        }
+        return 0L
+    }
 }
