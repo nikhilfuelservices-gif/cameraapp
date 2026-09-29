@@ -55,7 +55,7 @@ class GalleryActivity : ComponentActivity() {
             setPadding(10, 10, 10, 20)
             useDefaultMargins = false
         }
-        scroll.addView(grid, ScrollView.LayoutParams(-1, -2))
+        scroll.addView(grid, android.widget.FrameLayout.LayoutParams(-1, -2))
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
 
         setContentView(root)
