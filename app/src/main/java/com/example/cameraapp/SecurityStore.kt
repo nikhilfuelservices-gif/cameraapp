@@ -10,6 +10,7 @@ import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.Signature
 import java.security.spec.ECGenParameterSpec
+import java.util.Locale
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 
@@ -35,6 +36,12 @@ data class VerifiedPhoto(
 ) {
     val authentic: Boolean get() = signatureValid && hashValid && chainValid && recordHashValid
 }
+ 
+data class GalleryItem(
+    val verifiedPhoto: VerifiedPhoto,
+    val isOrphan: Boolean,
+    val sortTime: Long
+)
 
 class SecurityStore(context: Context) {
     private val root = File(context.filesDir, "authenticated").apply { mkdirs() }
@@ -105,6 +112,39 @@ class SecurityStore(context: Context) {
             output += VerifiedPhoto(record, file, sigValid, hashValid, chainValid, recordHashValid)
         }
         return output.asReversed()
+    }
+
+    fun listGalleryItems(): List<GalleryItem> {
+        val verified = listVerified()
+        val referenced = verified.map { it.file.absolutePath }.toHashSet()
+        val items = verified.map { GalleryItem(it, false, it.record.capturedEpochMs) }.toMutableList()
+
+        photoDir.listFiles { f ->
+            f.isFile && f.extension.lowercase(Locale.US) in setOf("jpg", "jpeg")
+        }?.filterNot { it.absolutePath in referenced }?.forEach { file ->
+            val hash = try { sha256(file.readBytes()) } catch (_: Exception) { "" }
+            val orphanRecord = CaptureRecord(
+                id = "UNVERIFIED-" + file.name,
+                sequence = 0L,
+                capturedEpochMs = 0L,
+                timestampText = "Capture record unavailable",
+                photoFile = file.name,
+                photoSha256 = hash,
+                previousHash = "",
+                signatureB64 = "",
+                recordHash = ""
+            )
+            val orphan = VerifiedPhoto(
+                record = orphanRecord,
+                file = file,
+                signatureValid = false,
+                hashValid = hash.isNotEmpty(),
+                chainValid = false,
+                recordHashValid = false
+            )
+            items += GalleryItem(orphan, true, file.lastModified())
+        }
+        return items.sortedByDescending { it.sortTime }
     }
 
     private fun readRecord(file: File): CaptureRecord? = try {
