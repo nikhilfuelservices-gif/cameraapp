@@ -21,7 +21,8 @@ data class CaptureRecord(
     val photoFile: String,
     val photoSha256: String,
     val previousHash: String,
-    val signatureB64: String
+    val signatureB64: String,
+    val recordHash: String
 )
 
 data class VerifiedPhoto(
@@ -29,9 +30,10 @@ data class VerifiedPhoto(
     val file: File,
     val signatureValid: Boolean,
     val hashValid: Boolean,
-    val chainValid: Boolean
+    val chainValid: Boolean,
+    val recordHashValid: Boolean
 ) {
-    val authentic: Boolean get() = signatureValid && hashValid && chainValid
+    val authentic: Boolean get() = signatureValid && hashValid && chainValid && recordHashValid
 }
 
 class SecurityStore(context: Context) {
@@ -56,12 +58,15 @@ class SecurityStore(context: Context) {
         val id = "CAM-%06d".format(sequence)
         val photoHash = sha256(photoFile.readBytes())
         val previousHash = recordDir.listFiles { f -> f.extension == "json" }
-            ?.mapNotNull(::readRecord)?.maxByOrNull { it.sequence }?.photoSha256 ?: ""
+            ?.mapNotNull(::readRecord)?.maxByOrNull { it.sequence }?.recordHash ?: ""
         val canonical = canonical(id, sequence, epochMs, timestampText, photoFile.name, photoHash, previousHash)
-        val signature = sign(canonical.toByteArray(StandardCharsets.UTF_8))
+        val canonicalBytes = canonical.toByteArray(StandardCharsets.UTF_8)
+        val signature = sign(canonicalBytes)
+        val signatureB64 = Base64.encodeToString(signature, Base64.NO_WRAP)
+        val recHash = recordHash(canonicalBytes, signature)
         val record = CaptureRecord(
             id, sequence, epochMs, timestampText, photoFile.name, photoHash, previousHash,
-            Base64.encodeToString(signature, Base64.NO_WRAP)
+            signatureB64, recHash
         )
         val json = JSONObject().apply {
             put("version", 1)
@@ -73,6 +78,7 @@ class SecurityStore(context: Context) {
             put("photoSha256", record.photoSha256)
             put("previousHash", record.previousHash)
             put("signatureB64", record.signatureB64)
+            put("recordHash", record.recordHash)
         }
         File(recordDir, "${record.sequence}.json").writeText(json.toString())
         return record
@@ -86,17 +92,17 @@ class SecurityStore(context: Context) {
         for (record in records) {
             val file = File(photoDir, record.photoFile)
             val hashValid = file.exists() && sha256(file.readBytes()) == record.photoSha256
-            val sigValid = try {
-                verify(
-                    canonical(record.id, record.sequence, record.capturedEpochMs, record.timestampText,
-                        record.photoFile, record.photoSha256, record.previousHash)
-                        .toByteArray(StandardCharsets.UTF_8),
-                    Base64.decode(record.signatureB64, Base64.NO_WRAP)
-                )
-            } catch (_: Exception) { false }
+            val signatureBytes = try { Base64.decode(record.signatureB64, Base64.NO_WRAP) } catch (_: Exception) { ByteArray(0) }
+            val canonicalBytes = canonical(
+                record.id, record.sequence, record.capturedEpochMs, record.timestampText,
+                record.photoFile, record.photoSha256, record.previousHash
+            ).toByteArray(StandardCharsets.UTF_8)
+            val sigValid = try { verify(canonicalBytes, signatureBytes) } catch (_: Exception) { false }
+            val actualRecordHash = if (signatureBytes.isNotEmpty()) recordHash(canonicalBytes, signatureBytes) else ""
+            val recordHashValid = actualRecordHash.isNotEmpty() && actualRecordHash == record.recordHash
             val chainValid = sigValid && record.previousHash == expectedPrevious
-            expectedPrevious = record.photoSha256
-            output += VerifiedPhoto(record, file, sigValid, hashValid, chainValid)
+            expectedPrevious = record.recordHash
+            output += VerifiedPhoto(record, file, sigValid, hashValid, chainValid, recordHashValid)
         }
         return output.asReversed()
     }
@@ -106,7 +112,7 @@ class SecurityStore(context: Context) {
         CaptureRecord(
             j.getString("id"), j.getLong("sequence"), j.getLong("capturedEpochMs"),
             j.getString("timestampText"), j.getString("photoFile"), j.getString("photoSha256"),
-            j.getString("previousHash"), j.getString("signatureB64")
+            j.getString("previousHash"), j.getString("signatureB64"), j.getString("recordHash")
         )
     } catch (_: Exception) { null }
 
@@ -147,6 +153,9 @@ class SecurityStore(context: Context) {
         photoFile, photoSha256, previousHash
     ).joinToString("
 ")
+
+    private fun recordHash(canonicalBytes: ByteArray, signature: ByteArray): String =
+        sha256(canonicalBytes + signature)
 
     private fun sha256(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256").digest(bytes)
